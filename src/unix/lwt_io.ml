@@ -1614,6 +1614,21 @@ let shutdown_server server = Lazy.force server.shutdown
 let shutdown_server_deprecated server =
   Lwt.async (fun () -> shutdown_server server)
 
+let retry_accept_after_error_delay = 0.5
+
+(* The events the accept loop reacts to. [Accepted] and [Try_again] are outcomes
+   of [accept]; [Connection_ended] and [Should_stop] are signalled from outside
+   the loop. They share one type because the loop waits for them with [Lwt.pick]
+   over the same [should_stop] promise, which is created once and reused across
+   iterations: wrapping that promise per iteration, to give each wait a narrower
+   type, would attach a callback to it per accepted connection. Hence the
+   [assert false] arms below, for the events a given [Lwt.pick] cannot yield. *)
+type accept_loop_event =
+  | Accepted of Lwt_unix.file_descr * Unix.sockaddr
+  | Connection_ended
+  | Try_again
+  | Should_stop
+
 (* There are several variants of establish_server that have accumulated over the
    years in Lwt_io. This is their underlying implementation. The functions
    exposed in the API are various wrappers around this one. *)
@@ -1642,14 +1657,10 @@ let establish_server_generic
   Lwt_unix.setsockopt listening_socket Unix.SO_REUSEADDR true;
   prepare_listening_fd listening_socket;
 
-  (* This promise gets resolved with `Should_stop when the user calls
+  (* This promise gets resolved with Should_stop when the user calls
      Lwt_io.shutdown_server. This begins the shutdown procedure. *)
   let should_stop, notify_should_stop =
     Lwt.wait () in
-
-  let when_should_stop () =
-    should_stop >|= fun `Should_stop -> `Should_stop
-  in
 
   (* Some time after Lwt_io.shutdown_server is called, this function
      establish_server_generic will actually close the listening socket. At that
@@ -1681,7 +1692,7 @@ let establish_server_generic
     | None -> ()
     | Some (_, resolver) ->
       notify_connection_ended := None;
-      Lwt.wakeup_later resolver `Connection_ended
+      Lwt.wakeup_later resolver Connection_ended
   in
 
   let stop () =
@@ -1700,9 +1711,10 @@ let establish_server_generic
 
   let rec accept_loop () =
     if at_max_connections () then
-      Lwt.pick [wait_for_connection_to_end (); when_should_stop ()] >>= function
-      | `Connection_ended -> accept_loop ()
-      | `Should_stop -> stop ()
+      Lwt.pick [wait_for_connection_to_end (); should_stop] >>= function
+      | Connection_ended -> accept_loop ()
+      | Should_stop -> stop ()
+      | Accepted _ | Try_again -> assert false
     else
       accept_one ()
 
@@ -1710,16 +1722,22 @@ let establish_server_generic
     let try_to_accept =
       Lwt.catch
         (fun () ->
-           Lwt_unix.accept listening_socket >|= fun x ->
-           `Accepted x)
+           Lwt_unix.accept listening_socket >|= fun (socket, address) ->
+           Accepted (socket, address))
         (function
           | Unix.Unix_error (Unix.ECONNABORTED, _, _) ->
-            Lwt.return `Try_again
+            Lwt.return Try_again
+
+          | Unix.Unix_error
+              ((Unix.EMFILE | Unix.ENFILE | Unix.ENOBUFS | Unix.ENOMEM), _, _) ->
+            Lwt_unix.sleep retry_accept_after_error_delay >|= fun () ->
+            Try_again
+
           | e -> Lwt.reraise e)
     in
 
-    Lwt.pick [try_to_accept; when_should_stop ()] >>= function
-    | `Accepted (client_socket, client_address) ->
+    Lwt.pick [try_to_accept; should_stop] >>= function
+    | Accepted (client_socket, client_address) ->
       begin
         try
           Lwt_unix.set_close_on_exec client_socket
@@ -1736,16 +1754,18 @@ let establish_server_generic
 
       accept_loop ()
 
-    | `Should_stop ->
+    | Should_stop ->
       stop ()
-    | `Try_again ->
+    | Try_again ->
       accept_loop ()
+    | Connection_ended ->
+      assert false
   in
 
   let server =
     {shutdown =
       lazy begin
-        Lwt.wakeup_later notify_should_stop `Should_stop;
+        Lwt.wakeup_later notify_should_stop Should_stop;
         wait_until_listening_socket_closed
       end}
   in
