@@ -625,6 +625,7 @@ val establish_server_with_client_socket :
   ?set_tcp_nodelay:bool ->
   ?prepare_listening_fd:(Lwt_unix.file_descr -> unit) ->
   ?prepare_client_fd:(Lwt_unix.file_descr -> unit) ->
+  ?max_connections:int ->
   Unix.sockaddr ->
   (Lwt_unix.sockaddr -> Lwt_unix.file_descr -> unit Lwt.t) ->
     server Lwt.t
@@ -668,12 +669,38 @@ f client_address client_socket
     [~backlog] is the argument passed to {!Lwt_unix.listen}. Its default value
     is [SOMAXCONN], which varies by platform and socket kind.
 
+    [~max_connections] bounds the number of connections the server handles
+    simultaneously. By default there is no bound, so a server can be brought
+    down by a client opening enough connections to exhaust the process's file
+    descriptors: [accept] then fails with [EMFILE], which reaches
+    {!Lwt.async_exception_hook}.
+
+    A connection counts against the limit from the moment it is accepted until
+    the promise returned by [f] resolves {e and} the connection has been closed
+    automatically: that is [client_socket] here, and both channels in
+    {!establish_server_with_client_address}. With [~no_close:true] the
+    connection stops counting as soon as [f]'s promise resolves, since the
+    server no longer owns the connection.
+
+    While the limit is reached, the server stops calling [accept]. Note that this
+    queues excess clients rather than rejecting them: the kernel completes their
+    connections into the listening backlog, where they wait, without a reply,
+    until the server accepts them. So [~max_connections] bounds the file
+    descriptors held by the server, not the clients that can connect: that is
+    bounded by [~backlog], beyond which the kernel refuses or drops connections.
+    To reject excess clients explicitly instead, leave [~max_connections] unset
+    and have [f] count connections itself, replying and closing when it is
+    called above the intended limit.
+
     The returned promise (a [server Lwt.t]) resolves when the server has just
     started listening on [listen_address]: right after the internal call to
     [listen], and right before the first internal call to [accept].
 
     See {!open_connection} for more details about [set_tcp_nodelay]
       and [prepare_fd].
+
+    @raise Invalid_argument if [~max_connections] is less than [1]: the
+      returned promise is rejected with it.
 
     @since 4.1.0 *)
 
@@ -685,6 +712,7 @@ val establish_server_with_client_address :
   ?set_tcp_nodelay:bool ->
   ?prepare_listening_fd:(Lwt_unix.file_descr -> unit) ->
   ?prepare_client_fd:(Lwt_unix.file_descr -> unit) ->
+  ?max_connections:int ->
   Unix.sockaddr ->
   (Lwt_unix.sockaddr -> input_channel * output_channel -> unit Lwt.t) ->
     server Lwt.t
@@ -695,8 +723,13 @@ val establish_server_with_client_address :
     The channels are closed automatically when the promise returned by [f]
     resolves. To avoid this behavior, pass [~no_close:true].
 
-    See {!open_connection} for more details about [set_tcp_nodelay]
-      and [prepare_*_fd].
+    See {!establish_server_with_client_socket} for more details about
+      [max_connections], which is supported since Lwt 6.2.0, and
+      {!open_connection} for more details about [set_tcp_nodelay] and
+      [prepare_*_fd].
+
+    @raise Invalid_argument if [~max_connections] is less than [1]: the
+      returned promise is rejected with it.
 
     @since 3.1.0 *)
 
