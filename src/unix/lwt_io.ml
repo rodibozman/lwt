@@ -1671,7 +1671,8 @@ let establish_server_generic
 
       optionally_set_tcp_nodelay set_tcp_nodelay client_socket;
       prepare_client_fd client_socket;
-      connection_handler_callback client_address client_socket;
+      Lwt.async (fun () ->
+        connection_handler_callback client_address client_socket);
 
       accept_loop ()
 
@@ -1716,28 +1717,26 @@ let establish_server_with_client_socket
     ?set_tcp_nodelay ?prepare_listening_fd ?prepare_client_fd
     sockaddr f =
   let handler client_address client_socket =
-    Lwt.async begin fun () ->
-      (* Not using Lwt.finalize here, to make sure that exceptions from [f]
-         reach !Lwt.async_exception_hook before exceptions from closing the
-         channels. *)
-      Lwt.catch
-        (fun () -> f client_address client_socket)
-        (fun exn ->
-          !Lwt.async_exception_hook exn;
-          Lwt.return_unit)
+    (* Not using Lwt.finalize here, to make sure that exceptions from [f]
+       reach !Lwt.async_exception_hook before exceptions from closing the
+       channels. *)
+    Lwt.catch
+      (fun () -> f client_address client_socket)
+      (fun exn ->
+        !Lwt.async_exception_hook exn;
+        Lwt.return_unit)
 
-      >>= fun () ->
-      if no_close then Lwt.return_unit
+    >>= fun () ->
+    if no_close then Lwt.return_unit
+    else
+      if Lwt_unix.state client_socket = Lwt_unix.Closed then
+        Lwt.return_unit
       else
-        if Lwt_unix.state client_socket = Lwt_unix.Closed then
-          Lwt.return_unit
-        else
-          Lwt.catch
-            (fun () -> close_socket client_socket)
-            (fun exn ->
-              !Lwt.async_exception_hook exn;
-              Lwt.return_unit)
-    end
+        Lwt.catch
+          (fun () -> close_socket client_socket)
+          (fun exn ->
+            !Lwt.async_exception_hook exn;
+            Lwt.return_unit)
   in
 
   let server, server_started =
@@ -1777,38 +1776,37 @@ let establish_server_with_client_address_generic
   in
 
   let handler client_address client_socket =
-    Lwt.async (fun () ->
-      let close = lazy (close_socket client_socket) in
-      let input_channel =
-        of_fd
-          ~buffer:(Lwt_bytes.create buffer_size)
-          ~mode:input
-          ~close:(fun () -> Lazy.force close)
-          client_socket
-      in
-      let output_channel =
-        of_fd
-          ~buffer:(Lwt_bytes.create buffer_size)
-          ~mode:output
-          ~close:(fun () -> Lazy.force close)
-          client_socket
-      in
+    let close = lazy (close_socket client_socket) in
+    let input_channel =
+      of_fd
+        ~buffer:(Lwt_bytes.create buffer_size)
+        ~mode:input
+        ~close:(fun () -> Lazy.force close)
+        client_socket
+    in
+    let output_channel =
+      of_fd
+        ~buffer:(Lwt_bytes.create buffer_size)
+        ~mode:output
+        ~close:(fun () -> Lazy.force close)
+        client_socket
+    in
 
-      (* Not using Lwt.finalize here, to make sure that exceptions from [f]
-         reach !Lwt.async_exception_hook before exceptions from closing the
-         channels. *)
-      Lwt.catch
-        (fun () ->
-          handler client_address (input_channel, output_channel))
-        (fun exn ->
-          !Lwt.async_exception_hook exn;
-          Lwt.return_unit)
+    (* Not using Lwt.finalize here, to make sure that exceptions from [f]
+       reach !Lwt.async_exception_hook before exceptions from closing the
+       channels. *)
+    Lwt.catch
+      (fun () ->
+        handler client_address (input_channel, output_channel))
+      (fun exn ->
+        !Lwt.async_exception_hook exn;
+        Lwt.return_unit)
 
-      >>= fun () ->
-      if no_close then Lwt.return_unit
-      else
-        best_effort_close input_channel >>= fun () ->
-        best_effort_close output_channel)
+    >>= fun () ->
+    if no_close then Lwt.return_unit
+    else
+      best_effort_close input_channel >>= fun () ->
+      best_effort_close output_channel
   in
 
   establish_server_generic bind_function ?fd ?backlog
